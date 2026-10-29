@@ -3,8 +3,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -143,6 +146,75 @@ class VoiceRuntimeTests(unittest.TestCase):
 
         self.assertEqual(["taskkill", "/PID", "4321", "/T", "/F"], taskkill.call_args.args[0])
         process.kill.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_windows_timeout_stops_a_real_descendant_process(self) -> None:
+        marker = self.base / "descendant-survived.txt"
+        child_code = (
+            "import pathlib, sys, time; time.sleep(2); "
+            "pathlib.Path(sys.argv[1]).write_text('alive')"
+        )
+        parent_code = (
+            "import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+            "print(child.pid, flush=True); time.sleep(30)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", parent_code, child_code, str(marker)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        child_pid: int | None = None
+        taskkill_results: list[subprocess.CompletedProcess[str]] = []
+        try:
+            assert process.stdout is not None
+            child_pid = int(process.stdout.readline().strip())
+            real_run = subprocess.run
+
+            def capture_taskkill(
+                *args: object, **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                command = args[0] if args else None
+                if isinstance(command, list) and command and command[0] == "taskkill":
+                    captured_kwargs = dict(kwargs)
+                    captured_kwargs.pop("stdout", None)
+                    captured_kwargs.pop("stderr", None)
+                    captured_kwargs["capture_output"] = True
+                    captured_kwargs["text"] = True
+                    result = real_run(*args, **captured_kwargs)
+                    taskkill_results.append(result)
+                    return result
+                return real_run(*args, **kwargs)
+
+            with mock.patch(
+                "voice_dubbing_runtime.runtime.subprocess.run", side_effect=capture_taskkill
+            ):
+                VoiceRuntime._terminate_process(process)
+            process.wait(timeout=5)
+
+            if taskkill_results and taskkill_results[0].returncode != 0:
+                if "user name or password is incorrect" in taskkill_results[0].stderr.lower():
+                    self.skipTest("The sandbox does not allow taskkill to inspect process trees")
+                self.fail(f"taskkill failed: {taskkill_results[0].stderr.strip()}")
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.05)
+            self.assertFalse(marker.exists(), "taskkill /T should terminate the child process too")
+        finally:
+            if process.poll() is None:
+                VoiceRuntime._terminate_process(process)
+            if child_pid is not None and marker.exists() is False:
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            if process.stdout is not None:
+                process.stdout.close()
 
     @unittest.skipIf(os.name == "nt", "POSIX-only process-group behavior")
     @mock.patch("voice_dubbing_runtime.runtime.os.killpg")
